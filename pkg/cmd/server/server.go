@@ -120,6 +120,7 @@ type serverConfig struct {
 	profilerAddress                                                         string
 	formatFlag                                                              *logging.FormatFlag
 	defaultResticMaintenanceFrequency                                       time.Duration
+	ignoredScheduleLabels                                                   []string
 }
 
 type controllerRunInfo struct {
@@ -207,6 +208,7 @@ func NewCommand(f client.Factory) *cobra.Command {
 	command.Flags().DurationVar(&config.resourceTerminatingTimeout, "terminating-resource-timeout", config.resourceTerminatingTimeout, "how long to wait on persistent volumes and namespaces to terminate during a restore before timing out")
 	command.Flags().DurationVar(&config.defaultBackupTTL, "default-backup-ttl", config.defaultBackupTTL, "how long to wait by default before backups can be garbage collected")
 	command.Flags().DurationVar(&config.defaultResticMaintenanceFrequency, "default-restic-prune-frequency", config.defaultResticMaintenanceFrequency, "how often 'restic prune' is run for restic repositories by default")
+	command.Flags().StringSliceVar(&config.ignoredScheduleLabels, "ignore-schedule-label", config.ignoredScheduleLabels, "labels in Schdule resource to not copy to the Backup resources")
 
 	return command
 }
@@ -608,6 +610,7 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 			s.sharedInformerFactory.Velero().V1().Schedules(),
 			s.logger,
 			s.metrics,
+			s.config.ignoredScheduleLabels,
 		)
 
 		return controllerRunInfo{
