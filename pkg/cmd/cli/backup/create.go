@@ -114,7 +114,7 @@ func (o *CreateOptions) BindFlags(flags *pflag.FlagSet) {
 	flags.StringVar(&o.StorageLocation, "storage-location", "", "location in which to store the backup")
 	flags.StringSliceVar(&o.SnapshotLocations, "volume-snapshot-locations", o.SnapshotLocations, "list of locations (at most one per provider) where volume snapshots should be stored")
 	flags.VarP(&o.Selector, "selector", "l", "only back up resources matching this label selector")
-	flags.StringSliceVar(&o.IgnoredScheduleLabels, "ignore-schedule-label", o.IgnoredScheduleLabels, "labels in Schdule resource to not copy to the Backup resources")
+	flags.StringSliceVar(&o.IgnoredScheduleLabels, "ignore-schedule-label", o.IgnoredScheduleLabels, "labels in Schedule resource to not copy to the Backup resources")
 	f := flags.VarPF(&o.SnapshotVolumes, "snapshot-volumes", "", "take snapshots of PersistentVolumes as part of the backup")
 	// this allows the user to just specify "--snapshot-volumes" as shorthand for "--snapshot-volumes=true"
 	// like a normal bool flag
