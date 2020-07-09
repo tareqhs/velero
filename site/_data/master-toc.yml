@@ -17,7 +17,7 @@ toc:
         url: /upgrade-to-1.3
       - page: Supported providers
         url: /supported-providers
-      - page: Evaluation install 
+      - page: Evaluation install
         url: /contributions/minio
       - page: Restic integration
         url: /restic
@@ -41,6 +41,10 @@ toc:
         url: /hooks
       - page: CSI Support (beta)
         url: /csi
+      - page: Verifying Self-signed Certificates
+        url: /self-signed-certificates
+      - page: Changing RBAC permissions
+        url: /rbac
   - title: Plugins
     subfolderitems:
       - page: Overview
@@ -71,6 +75,8 @@ toc:
         url: /code-standards
       - page: Website guidelines
         url: /website-guidelines
+      - page: Documentation style guide
+        url: /style-guide
   - title: More information
     subfolderitems:
       - page: Backup file format

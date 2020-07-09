@@ -1,5 +1,5 @@
 /*
-Copyright 2017, 2019 the Velero contributors.
+Copyright 2020 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package controller
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,9 +38,13 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/tools/cache"
 
+	snapshotv1beta1api "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
+	snapshotv1beta1listers "github.com/kubernetes-csi/external-snapshotter/v2/pkg/client/listers/volumesnapshot/v1beta1"
+
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	pkgbackup "github.com/vmware-tanzu/velero/pkg/backup"
 	"github.com/vmware-tanzu/velero/pkg/discovery"
+	"github.com/vmware-tanzu/velero/pkg/features"
 	velerov1client "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
 	velerov1informers "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions/velero/v1"
 	velerov1listers "github.com/vmware-tanzu/velero/pkg/generated/listers/velero/v1"
@@ -47,31 +52,37 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/metrics"
 	"github.com/vmware-tanzu/velero/pkg/persistence"
 	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
+	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
 	"github.com/vmware-tanzu/velero/pkg/util/collections"
 	"github.com/vmware-tanzu/velero/pkg/util/encode"
 	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 	"github.com/vmware-tanzu/velero/pkg/util/logging"
 	"github.com/vmware-tanzu/velero/pkg/volume"
+
+	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type backupController struct {
 	*genericController
-	discoveryHelper          discovery.Helper
-	backupper                pkgbackup.Backupper
-	lister                   velerov1listers.BackupLister
-	client                   velerov1client.BackupsGetter
-	clock                    clock.Clock
-	backupLogLevel           logrus.Level
-	newPluginManager         func(logrus.FieldLogger) clientmgmt.Manager
-	backupTracker            BackupTracker
-	backupLocationLister     velerov1listers.BackupStorageLocationLister
-	defaultBackupLocation    string
-	defaultBackupTTL         time.Duration
-	snapshotLocationLister   velerov1listers.VolumeSnapshotLocationLister
-	defaultSnapshotLocations map[string]string
-	metrics                  *metrics.ServerMetrics
-	newBackupStore           func(*velerov1api.BackupStorageLocation, persistence.ObjectStoreGetter, logrus.FieldLogger) (persistence.BackupStore, error)
-	formatFlag               logging.Format
+	discoveryHelper             discovery.Helper
+	backupper                   pkgbackup.Backupper
+	lister                      velerov1listers.BackupLister
+	client                      velerov1client.BackupsGetter
+	kbClient                    kbclient.Client
+	clock                       clock.Clock
+	backupLogLevel              logrus.Level
+	newPluginManager            func(logrus.FieldLogger) clientmgmt.Manager
+	backupTracker               BackupTracker
+	defaultBackupLocation       string
+	defaultVolumesToRestic      bool
+	defaultBackupTTL            time.Duration
+	snapshotLocationLister      velerov1listers.VolumeSnapshotLocationLister
+	defaultSnapshotLocations    map[string]string
+	metrics                     *metrics.ServerMetrics
+	newBackupStore              func(*velerov1api.BackupStorageLocation, persistence.ObjectStoreGetter, logrus.FieldLogger) (persistence.BackupStore, error)
+	formatFlag                  logging.Format
+	volumeSnapshotLister        snapshotv1beta1listers.VolumeSnapshotLister
+	volumeSnapshotContentLister snapshotv1beta1listers.VolumeSnapshotContentLister
 }
 
 func NewBackupController(
@@ -83,33 +94,38 @@ func NewBackupController(
 	backupLogLevel logrus.Level,
 	newPluginManager func(logrus.FieldLogger) clientmgmt.Manager,
 	backupTracker BackupTracker,
-	backupLocationLister velerov1listers.BackupStorageLocationLister,
+	kbClient kbclient.Client,
 	defaultBackupLocation string,
+	defaultVolumesToRestic bool,
 	defaultBackupTTL time.Duration,
 	volumeSnapshotLocationLister velerov1listers.VolumeSnapshotLocationLister,
 	defaultSnapshotLocations map[string]string,
 	metrics *metrics.ServerMetrics,
 	formatFlag logging.Format,
+	volumeSnapshotLister snapshotv1beta1listers.VolumeSnapshotLister,
+	volumeSnapshotContentLister snapshotv1beta1listers.VolumeSnapshotContentLister,
 ) Interface {
 	c := &backupController{
-		genericController:        newGenericController("backup", logger),
-		discoveryHelper:          discoveryHelper,
-		backupper:                backupper,
-		lister:                   backupInformer.Lister(),
-		client:                   client,
-		clock:                    &clock.RealClock{},
-		backupLogLevel:           backupLogLevel,
-		newPluginManager:         newPluginManager,
-		backupTracker:            backupTracker,
-		backupLocationLister:     backupLocationLister,
-		defaultBackupLocation:    defaultBackupLocation,
-		defaultBackupTTL:         defaultBackupTTL,
-		snapshotLocationLister:   volumeSnapshotLocationLister,
-		defaultSnapshotLocations: defaultSnapshotLocations,
-		metrics:                  metrics,
-		formatFlag:               formatFlag,
-
-		newBackupStore: persistence.NewObjectBackupStore,
+		genericController:           newGenericController("backup", logger),
+		discoveryHelper:             discoveryHelper,
+		backupper:                   backupper,
+		lister:                      backupInformer.Lister(),
+		client:                      client,
+		clock:                       &clock.RealClock{},
+		backupLogLevel:              backupLogLevel,
+		newPluginManager:            newPluginManager,
+		backupTracker:               backupTracker,
+		kbClient:                    kbClient,
+		defaultBackupLocation:       defaultBackupLocation,
+		defaultVolumesToRestic:      defaultVolumesToRestic,
+		defaultBackupTTL:            defaultBackupTTL,
+		snapshotLocationLister:      volumeSnapshotLocationLister,
+		defaultSnapshotLocations:    defaultSnapshotLocations,
+		metrics:                     metrics,
+		formatFlag:                  formatFlag,
+		volumeSnapshotLister:        volumeSnapshotLister,
+		volumeSnapshotContentLister: volumeSnapshotContentLister,
+		newBackupStore:              persistence.NewObjectBackupStore,
 	}
 
 	c.syncHandler = c.processBackup
@@ -310,8 +326,11 @@ func (c *backupController) prepareBackupRequest(backup *velerov1api.Backup) *pkg
 		Backup: backup.DeepCopy(), // don't modify items in the cache
 	}
 
-	// set backup version
+	// set backup major version - deprecated, use Status.FormatVersion
 	request.Status.Version = pkgbackup.BackupVersion
+
+	// set backup major, minor, and patch version
+	request.Status.FormatVersion = pkgbackup.BackupFormatVersion
 
 	if request.Spec.TTL.Duration == 0 {
 		// set default backup TTL
@@ -326,6 +345,10 @@ func (c *backupController) prepareBackupRequest(backup *velerov1api.Backup) *pkg
 		request.Spec.StorageLocation = c.defaultBackupLocation
 	}
 
+	if request.Spec.DefaultVolumesToRestic == nil {
+		request.Spec.DefaultVolumesToRestic = &c.defaultVolumesToRestic
+	}
+
 	// add the storage location as a label for easy filtering later.
 	if request.Labels == nil {
 		request.Labels = make(map[string]string)
@@ -333,9 +356,12 @@ func (c *backupController) prepareBackupRequest(backup *velerov1api.Backup) *pkg
 	request.Labels[velerov1api.StorageLocationLabel] = label.GetValidName(request.Spec.StorageLocation)
 
 	// Getting all information of cluster version - useful for future skip-level migration
-	request.Labels[velerov1api.SourceClusterK8sGitVersionLabel] = label.GetValidName(c.discoveryHelper.ServerVersion().String())
-	request.Labels[velerov1api.SourceClusterK8sMajorVersionLabel] = label.GetValidName(c.discoveryHelper.ServerVersion().Major)
-	request.Labels[velerov1api.SourceClusterK8sMinorVersionLabel] = label.GetValidName(c.discoveryHelper.ServerVersion().Minor)
+	if request.Annotations == nil {
+		request.Annotations = make(map[string]string)
+	}
+	request.Annotations[velerov1api.SourceClusterK8sGitVersionAnnotation] = c.discoveryHelper.ServerVersion().String()
+	request.Annotations[velerov1api.SourceClusterK8sMajorVersionAnnotation] = c.discoveryHelper.ServerVersion().Major
+	request.Annotations[velerov1api.SourceClusterK8sMinorVersionAnnotation] = c.discoveryHelper.ServerVersion().Minor
 
 	// validate the included/excluded resources
 	for _, err := range collections.ValidateIncludesExcludes(request.Spec.IncludedResources, request.Spec.ExcludedResources) {
@@ -348,7 +374,11 @@ func (c *backupController) prepareBackupRequest(backup *velerov1api.Backup) *pkg
 	}
 
 	// validate the storage location, and store the BackupStorageLocation API obj on the request
-	if storageLocation, err := c.backupLocationLister.BackupStorageLocations(request.Namespace).Get(request.Spec.StorageLocation); err != nil {
+	storageLocation := &velerov1api.BackupStorageLocation{}
+	if err := c.kbClient.Get(context.Background(), kbclient.ObjectKey{
+		Namespace: request.Namespace,
+		Name:      request.Spec.StorageLocation,
+	}, storageLocation); err != nil {
 		if apierrors.IsNotFound(err) {
 			request.Status.ValidationErrors = append(request.Status.ValidationErrors, fmt.Sprintf("a BackupStorageLocation CRD with the name specified in the backup spec needs to be created before this backup can be executed. Error: %v", err))
 		} else {
@@ -362,7 +392,6 @@ func (c *backupController) prepareBackupRequest(backup *velerov1api.Backup) *pkg
 				fmt.Sprintf("backup can't be created because backup storage location %s is currently in read-only mode", request.StorageLocation.Name))
 		}
 	}
-
 	// validate and get the backup's VolumeSnapshotLocations, and store the
 	// VolumeSnapshotLocation API objs on the request
 	if locs, errs := c.validateAndGetSnapshotLocations(request.Backup); len(errs) > 0 {
@@ -385,9 +414,15 @@ func (c *backupController) prepareBackupRequest(backup *velerov1api.Backup) *pkg
 // - a given provider's default location name is added to .spec.volumeSnapshotLocations if one
 //   is not explicitly specified for the provider (if there's only one location for the provider,
 //   it will automatically be used)
+// if backup has snapshotVolume disabled then it returns empty VSL
 func (c *backupController) validateAndGetSnapshotLocations(backup *velerov1api.Backup) (map[string]*velerov1api.VolumeSnapshotLocation, []string) {
 	errors := []string{}
 	providerLocations := make(map[string]*velerov1api.VolumeSnapshotLocation)
+
+	// if snapshotVolume is set to false then we don't need to validate volumesnapshotlocation
+	if boolptr.IsSetToFalse(backup.Spec.SnapshotVolumes) {
+		return nil, nil
+	}
 
 	for _, locationName := range backup.Spec.VolumeSnapshotLocations {
 		// validate each locationName exists as a VolumeSnapshotLocation
@@ -511,7 +546,7 @@ func (c *backupController) runBackup(backup *pkgbackup.Request) error {
 		return err
 	}
 
-	backupLog.Info("Setting up backup store")
+	backupLog.Info("Setting up backup store to check for backup existence")
 	backupStore, err := c.newBackupStore(backup.StorageLocation, pluginManager, backupLog)
 	if err != nil {
 		return err
@@ -530,6 +565,31 @@ func (c *backupController) runBackup(backup *pkgbackup.Request) error {
 	var fatalErrs []error
 	if err := c.backupper.Backup(backupLog, backup, backupFile, actions, pluginManager); err != nil {
 		fatalErrs = append(fatalErrs, err)
+	}
+
+	// Empty slices here so that they can be passed in to the persistBackup call later, regardless of whether or not CSI's enabled.
+	// This way, we only make the Lister call if the feature flag's on.
+	var volumeSnapshots []*snapshotv1beta1api.VolumeSnapshot
+	var volumeSnapshotContents []*snapshotv1beta1api.VolumeSnapshotContent
+	if features.IsEnabled(velerov1api.CSIFeatureFlag) {
+		selector := label.NewSelectorForBackup(backup.Name)
+
+		// Listers are wrapped in a nil check out of caution, since they may not be populated based on the
+		// EnableCSI feature flag. This is more to guard against programmer error, as they shouldn't be nil
+		// when EnableCSI is on.
+		if c.volumeSnapshotLister != nil {
+			volumeSnapshots, err = c.volumeSnapshotLister.List(selector)
+			if err != nil {
+				backupLog.Error(err)
+			}
+		}
+
+		if c.volumeSnapshotContentLister != nil {
+			volumeSnapshotContents, err = c.volumeSnapshotContentLister.List(selector)
+			if err != nil {
+				backupLog.Error(err)
+			}
+		}
 	}
 
 	// Mark completion timestamp before serializing and uploading.
@@ -565,7 +625,15 @@ func (c *backupController) runBackup(backup *pkgbackup.Request) error {
 		backup.Status.Phase = velerov1api.BackupPhaseCompleted
 	}
 
-	if errs := persistBackup(backup, backupFile, logFile, backupStore, c.logger); len(errs) > 0 {
+	// re-instantiate the backup store because credentials could have changed since the original
+	// instantiation, if this was a long-running backup
+	backupLog.Info("Setting up backup store to persist the backup")
+	backupStore, err = c.newBackupStore(backup.StorageLocation, pluginManager, backupLog)
+	if err != nil {
+		return err
+	}
+
+	if errs := persistBackup(backup, backupFile, logFile, backupStore, c.logger, volumeSnapshots, volumeSnapshotContents); len(errs) > 0 {
 		fatalErrs = append(fatalErrs, errs...)
 	}
 
@@ -595,66 +663,72 @@ func recordBackupMetrics(log logrus.FieldLogger, backup *velerov1api.Backup, bac
 	serverMetrics.RegisterVolumeSnapshotFailures(backupScheduleName, backup.Status.VolumeSnapshotsAttempted-backup.Status.VolumeSnapshotsCompleted)
 }
 
-func persistBackup(backup *pkgbackup.Request, backupContents, backupLog *os.File, backupStore persistence.BackupStore, log logrus.FieldLogger) []error {
-	errs := []error{}
+func persistBackup(backup *pkgbackup.Request,
+	backupContents, backupLog *os.File,
+	backupStore persistence.BackupStore,
+	log logrus.FieldLogger,
+	csiVolumeSnapshots []*snapshotv1beta1api.VolumeSnapshot,
+	csiVolumeSnapshotContents []*snapshotv1beta1api.VolumeSnapshotContent,
+) []error {
+	persistErrs := []error{}
 	backupJSON := new(bytes.Buffer)
 
 	if err := encode.EncodeTo(backup.Backup, "json", backupJSON); err != nil {
-		errs = append(errs, errors.Wrap(err, "error encoding backup"))
+		persistErrs = append(persistErrs, errors.Wrap(err, "error encoding backup"))
 	}
 
-	volumeSnapshots := new(bytes.Buffer)
-	gzw := gzip.NewWriter(volumeSnapshots)
-
-	if err := json.NewEncoder(gzw).Encode(backup.VolumeSnapshots); err != nil {
-		errs = append(errs, errors.Wrap(err, "error encoding list of volume snapshots"))
-	}
-	if err := gzw.Close(); err != nil {
-		errs = append(errs, errors.Wrap(err, "error closing gzip writer"))
+	// Velero-native volume snapshots (as opposed to CSI ones)
+	nativeVolumeSnapshots, errs := encodeToJSONGzip(backup.VolumeSnapshots, "native volumesnapshots list")
+	if errs != nil {
+		persistErrs = append(persistErrs, errs...)
 	}
 
-	podVolumeBackups := new(bytes.Buffer)
-	gzw = gzip.NewWriter(podVolumeBackups)
-
-	if err := json.NewEncoder(gzw).Encode(backup.PodVolumeBackups); err != nil {
-		errs = append(errs, errors.Wrap(err, "error encoding pod volume backups"))
-	}
-	if err := gzw.Close(); err != nil {
-		errs = append(errs, errors.Wrap(err, "error closing gzip writer"))
+	podVolumeBackups, errs := encodeToJSONGzip(backup.PodVolumeBackups, "pod volume backups list")
+	if errs != nil {
+		persistErrs = append(persistErrs, errs...)
 	}
 
-	backupResourceList := new(bytes.Buffer)
-	gzw = gzip.NewWriter(backupResourceList)
-
-	if err := json.NewEncoder(gzw).Encode(backup.BackupResourceList()); err != nil {
-		errs = append(errs, errors.Wrap(err, "error encoding backup resource list"))
-	}
-	if err := gzw.Close(); err != nil {
-		errs = append(errs, errors.Wrap(err, "error closing gzip writer"))
+	csiSnapshotJSON, errs := encodeToJSONGzip(csiVolumeSnapshots, "csi volume snapshots list")
+	if errs != nil {
+		persistErrs = append(persistErrs, errs...)
 	}
 
-	if len(errs) > 0 {
+	csiSnapshotContentsJSON, errs := encodeToJSONGzip(csiVolumeSnapshotContents, "csi volume snapshot contents list")
+	if errs != nil {
+		persistErrs = append(persistErrs, errs...)
+	}
+
+	backupResourceList, errs := encodeToJSONGzip(backup.BackupResourceList(), "backup resources list")
+	if errs != nil {
+		persistErrs = append(persistErrs, errs...)
+	}
+
+	if len(persistErrs) > 0 {
 		// Don't upload the JSON files or backup tarball if encoding to json fails.
 		backupJSON = nil
 		backupContents = nil
-		volumeSnapshots = nil
+		nativeVolumeSnapshots = nil
 		backupResourceList = nil
+		csiSnapshotJSON = nil
+		csiSnapshotContentsJSON = nil
 	}
 
 	backupInfo := persistence.BackupInfo{
-		Name:               backup.Name,
-		Metadata:           backupJSON,
-		Contents:           backupContents,
-		Log:                backupLog,
-		PodVolumeBackups:   podVolumeBackups,
-		VolumeSnapshots:    volumeSnapshots,
-		BackupResourceList: backupResourceList,
+		Name:                      backup.Name,
+		Metadata:                  backupJSON,
+		Contents:                  backupContents,
+		Log:                       backupLog,
+		PodVolumeBackups:          podVolumeBackups,
+		VolumeSnapshots:           nativeVolumeSnapshots,
+		BackupResourceList:        backupResourceList,
+		CSIVolumeSnapshots:        csiSnapshotJSON,
+		CSIVolumeSnapshotContents: csiSnapshotContentsJSON,
 	}
 	if err := backupStore.PutBackup(backupInfo); err != nil {
-		errs = append(errs, err)
+		persistErrs = append(persistErrs, err)
 	}
 
-	return errs
+	return persistErrs
 }
 
 func closeAndRemoveFile(file *os.File, log logrus.FieldLogger) {
@@ -664,4 +738,27 @@ func closeAndRemoveFile(file *os.File, log logrus.FieldLogger) {
 	if err := os.Remove(file.Name()); err != nil {
 		log.WithError(err).WithField("file", file.Name()).Error("error removing file")
 	}
+}
+
+// encodeToJSONGzip takes arbitrary Go data and encodes it to GZip compressed JSON in a buffer, as well as a description of the data to put into an error should encoding fail.
+func encodeToJSONGzip(data interface{}, desc string) (*bytes.Buffer, []error) {
+	buf := new(bytes.Buffer)
+	gzw := gzip.NewWriter(buf)
+
+	// Since both encoding and closing the gzip writer could fail separately and both errors are useful,
+	// collect both errors to report back.
+	errs := []error{}
+
+	if err := json.NewEncoder(gzw).Encode(data); err != nil {
+		errs = append(errs, errors.Wrapf(err, "error encoding %s", desc))
+	}
+	if err := gzw.Close(); err != nil {
+		errs = append(errs, errors.Wrapf(err, "error closing gzip writer for %s", desc))
+	}
+
+	if len(errs) > 0 {
+		return nil, errs
+	}
+
+	return buf, nil
 }

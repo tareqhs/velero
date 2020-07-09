@@ -17,10 +17,14 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
+	snapshotv1beta1api "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
+	snapshotFake "github.com/kubernetes-csi/external-snapshotter/v2/pkg/client/clientset/versioned/fake"
+	snapshotv1beta1informers "github.com/kubernetes-csi/external-snapshotter/v2/pkg/client/informers/externalversions"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
@@ -31,8 +35,9 @@ import (
 	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/sets"
 	core "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	v1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	pkgbackup "github.com/vmware-tanzu/velero/pkg/backup"
 	"github.com/vmware-tanzu/velero/pkg/builder"
 	"github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/fake"
@@ -60,8 +65,11 @@ func TestBackupDeletionControllerProcessQueueItem(t *testing.T) {
 		NewBackupTracker(),
 		nil, // restic repository manager
 		sharedInformers.Velero().V1().PodVolumeBackups().Lister(),
-		sharedInformers.Velero().V1().BackupStorageLocations().Lister(),
+		nil,
 		sharedInformers.Velero().V1().VolumeSnapshotLocations().Lister(),
+		nil, // csiSnapshotLister
+		nil, // csiSnapshotContentLister
+		nil, // csiSnapshotClient
 		nil, // new plugin manager func
 		metrics.NewServerMetrics(),
 	).(*backupDeletionController)
@@ -78,21 +86,21 @@ func TestBackupDeletionControllerProcessQueueItem(t *testing.T) {
 	req := pkgbackup.NewDeleteBackupRequest("foo", "uid")
 	req.Namespace = "foo"
 	req.Name = "foo-abcde"
-	req.Status.Phase = v1.DeleteBackupRequestPhaseProcessed
+	req.Status.Phase = velerov1api.DeleteBackupRequestPhaseProcessed
 
 	err = controller.processQueueItem("foo/bar")
 	assert.NoError(t, err)
 
 	// Invoke processRequestFunc
-	for _, phase := range []v1.DeleteBackupRequestPhase{"", v1.DeleteBackupRequestPhaseNew, v1.DeleteBackupRequestPhaseInProgress} {
+	for _, phase := range []velerov1api.DeleteBackupRequestPhase{"", velerov1api.DeleteBackupRequestPhaseNew, velerov1api.DeleteBackupRequestPhaseInProgress} {
 		t.Run(fmt.Sprintf("phase=%s", phase), func(t *testing.T) {
 			req.Status.Phase = phase
 			sharedInformers.Velero().V1().DeleteBackupRequests().Informer().GetStore().Add(req)
 
 			var errorToReturn error
-			var actual *v1.DeleteBackupRequest
+			var actual *velerov1api.DeleteBackupRequest
 			var called bool
-			controller.processRequestFunc = func(r *v1.DeleteBackupRequest) error {
+			controller.processRequestFunc = func(r *velerov1api.DeleteBackupRequest) error {
 				called = true
 				actual = r
 				return errorToReturn
@@ -115,20 +123,22 @@ func TestBackupDeletionControllerProcessQueueItem(t *testing.T) {
 
 type backupDeletionControllerTestData struct {
 	client            *fake.Clientset
+	fakeClient        client.Client
 	sharedInformers   informers.SharedInformerFactory
 	volumeSnapshotter *velerotest.FakeVolumeSnapshotter
 	backupStore       *persistencemocks.BackupStore
 	controller        *backupDeletionController
-	req               *v1.DeleteBackupRequest
+	req               *velerov1api.DeleteBackupRequest
 }
 
-func setupBackupDeletionControllerTest(objects ...runtime.Object) *backupDeletionControllerTestData {
+func setupBackupDeletionControllerTest(t *testing.T, objects ...runtime.Object) *backupDeletionControllerTestData {
 	req := pkgbackup.NewDeleteBackupRequest("foo", "uid")
 	req.Namespace = "velero"
 	req.Name = "foo-abcde"
 
 	var (
 		client            = fake.NewSimpleClientset(append(objects, req)...)
+		fakeClient        = newFakeClient(t, objects...)
 		sharedInformers   = informers.NewSharedInformerFactory(client, 0)
 		volumeSnapshotter = &velerotest.FakeVolumeSnapshotter{SnapshotsTaken: sets.NewString()}
 		pluginManager     = &pluginmocks.Manager{}
@@ -137,6 +147,7 @@ func setupBackupDeletionControllerTest(objects ...runtime.Object) *backupDeletio
 
 	data := &backupDeletionControllerTestData{
 		client:            client,
+		fakeClient:        fakeClient,
 		sharedInformers:   sharedInformers,
 		volumeSnapshotter: volumeSnapshotter,
 		backupStore:       backupStore,
@@ -150,8 +161,11 @@ func setupBackupDeletionControllerTest(objects ...runtime.Object) *backupDeletio
 			NewBackupTracker(),
 			nil, // restic repository manager
 			sharedInformers.Velero().V1().PodVolumeBackups().Lister(),
-			sharedInformers.Velero().V1().BackupStorageLocations().Lister(),
+			fakeClient,
 			sharedInformers.Velero().V1().VolumeSnapshotLocations().Lister(),
+			nil, // csiSnapshotLister
+			nil, // csiSnapshotContentLister
+			nil, // csiSnapshotClient
 			func(logrus.FieldLogger) clientmgmt.Manager { return pluginManager },
 			metrics.NewServerMetrics(),
 		).(*backupDeletionController),
@@ -159,7 +173,7 @@ func setupBackupDeletionControllerTest(objects ...runtime.Object) *backupDeletio
 		req: req,
 	}
 
-	data.controller.newBackupStore = func(*v1.BackupStorageLocation, persistence.ObjectStoreGetter, logrus.FieldLogger) (persistence.BackupStore, error) {
+	data.controller.newBackupStore = func(*velerov1api.BackupStorageLocation, persistence.ObjectStoreGetter, logrus.FieldLogger) (persistence.BackupStore, error) {
 		return backupStore, nil
 	}
 
@@ -170,8 +184,7 @@ func setupBackupDeletionControllerTest(objects ...runtime.Object) *backupDeletio
 
 func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 	t.Run("missing spec.backupName", func(t *testing.T) {
-		td := setupBackupDeletionControllerTest()
-
+		td := setupBackupDeletionControllerTest(t)
 		td.req.Spec.BackupName = ""
 
 		err := td.controller.processRequest(td.req)
@@ -179,7 +192,7 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 
 		expectedActions := []core.Action{
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
 				types.MergePatchType,
@@ -191,7 +204,7 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 	})
 
 	t.Run("existing deletion requests for the backup are deleted", func(t *testing.T) {
-		td := setupBackupDeletionControllerTest()
+		td := setupBackupDeletionControllerTest(t)
 
 		// add the backup to the tracker so the execution of processRequest doesn't progress
 		// past checking for an in-progress backup. this makes validation easier.
@@ -199,15 +212,15 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 
 		require.NoError(t, td.sharedInformers.Velero().V1().DeleteBackupRequests().Informer().GetStore().Add(td.req))
 
-		existing := &v1.DeleteBackupRequest{
+		existing := &velerov1api.DeleteBackupRequest{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: td.req.Namespace,
 				Name:      "bar",
 				Labels: map[string]string{
-					v1.BackupNameLabel: td.req.Spec.BackupName,
+					velerov1api.BackupNameLabel: td.req.Spec.BackupName,
 				},
 			},
-			Spec: v1.DeleteBackupRequestSpec{
+			Spec: velerov1api.DeleteBackupRequestSpec{
 				BackupName: td.req.Spec.BackupName,
 			},
 		}
@@ -216,15 +229,15 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 		require.NoError(t, err)
 
 		require.NoError(t, td.sharedInformers.Velero().V1().DeleteBackupRequests().Informer().GetStore().Add(
-			&v1.DeleteBackupRequest{
+			&velerov1api.DeleteBackupRequest{
 				ObjectMeta: metav1.ObjectMeta{
 					Namespace: td.req.Namespace,
 					Name:      "bar-2",
 					Labels: map[string]string{
-						v1.BackupNameLabel: "some-other-backup",
+						velerov1api.BackupNameLabel: "some-other-backup",
 					},
 				},
-				Spec: v1.DeleteBackupRequestSpec{
+				Spec: velerov1api.DeleteBackupRequestSpec{
 					BackupName: "some-other-backup",
 				},
 			},
@@ -233,7 +246,7 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 		assert.NoError(t, td.controller.processRequest(td.req))
 
 		expectedDeleteAction := core.NewDeleteAction(
-			v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+			velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 			td.req.Namespace,
 			"bar",
 		)
@@ -246,7 +259,7 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 	})
 
 	t.Run("deleting an in progress backup isn't allowed", func(t *testing.T) {
-		td := setupBackupDeletionControllerTest()
+		td := setupBackupDeletionControllerTest(t)
 
 		td.controller.backupTracker.Add(td.req.Namespace, td.req.Spec.BackupName)
 
@@ -255,7 +268,7 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 
 		expectedActions := []core.Action{
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
 				types.MergePatchType,
@@ -267,12 +280,10 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 	})
 
 	t.Run("patching to InProgress fails", func(t *testing.T) {
-		backup := builder.ForBackup(v1.DefaultNamespace, "foo").StorageLocation("default").Result()
+		backup := builder.ForBackup(velerov1api.DefaultNamespace, "foo").StorageLocation("default").Result()
 		location := builder.ForBackupStorageLocation("velero", "default").Result()
 
-		td := setupBackupDeletionControllerTest(backup)
-
-		td.sharedInformers.Velero().V1().BackupStorageLocations().Informer().GetStore().Add(location)
+		td := setupBackupDeletionControllerTest(t, location, backup)
 
 		td.client.PrependReactor("patch", "deletebackuprequests", func(action core.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("bad")
@@ -283,12 +294,12 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 
 		expectedActions := []core.Action{
 			core.NewGetAction(
-				v1.SchemeGroupVersion.WithResource("backups"),
+				velerov1api.SchemeGroupVersion.WithResource("backups"),
 				backup.Namespace,
 				backup.Name,
 			),
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
 				types.MergePatchType,
@@ -299,12 +310,10 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 	})
 
 	t.Run("patching backup to Deleting fails", func(t *testing.T) {
-		backup := builder.ForBackup(v1.DefaultNamespace, "foo").StorageLocation("default").Result()
+		backup := builder.ForBackup(velerov1api.DefaultNamespace, "foo").StorageLocation("default").Result()
 		location := builder.ForBackupStorageLocation("velero", "default").Result()
 
-		td := setupBackupDeletionControllerTest(backup)
-
-		td.sharedInformers.Velero().V1().BackupStorageLocations().Informer().GetStore().Add(location)
+		td := setupBackupDeletionControllerTest(t, location, backup)
 
 		td.client.PrependReactor("patch", "deletebackuprequests", func(action core.Action) (bool, runtime.Object, error) {
 			return true, td.req, nil
@@ -318,19 +327,19 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 
 		expectedActions := []core.Action{
 			core.NewGetAction(
-				v1.SchemeGroupVersion.WithResource("backups"),
+				velerov1api.SchemeGroupVersion.WithResource("backups"),
 				backup.Namespace,
 				backup.Name,
 			),
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
 				types.MergePatchType,
 				[]byte(`{"status":{"phase":"InProgress"}}`),
 			),
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("backups"),
+				velerov1api.SchemeGroupVersion.WithResource("backups"),
 				backup.Namespace,
 				backup.Name,
 				types.MergePatchType,
@@ -341,19 +350,19 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 	})
 
 	t.Run("unable to find backup", func(t *testing.T) {
-		td := setupBackupDeletionControllerTest()
+		td := setupBackupDeletionControllerTest(t)
 
 		err := td.controller.processRequest(td.req)
 		require.NoError(t, err)
 
 		expectedActions := []core.Action{
 			core.NewGetAction(
-				v1.SchemeGroupVersion.WithResource("backups"),
+				velerov1api.SchemeGroupVersion.WithResource("backups"),
 				td.req.Namespace,
 				td.req.Spec.BackupName,
 			),
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
 				types.MergePatchType,
@@ -365,21 +374,21 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 	})
 
 	t.Run("unable to find backup storage location", func(t *testing.T) {
-		backup := builder.ForBackup(v1.DefaultNamespace, "foo").StorageLocation("default").Result()
+		backup := builder.ForBackup(velerov1api.DefaultNamespace, "foo").StorageLocation("default").Result()
 
-		td := setupBackupDeletionControllerTest(backup)
+		td := setupBackupDeletionControllerTest(t, backup)
 
 		err := td.controller.processRequest(td.req)
 		require.NoError(t, err)
 
 		expectedActions := []core.Action{
 			core.NewGetAction(
-				v1.SchemeGroupVersion.WithResource("backups"),
+				velerov1api.SchemeGroupVersion.WithResource("backups"),
 				td.req.Namespace,
 				td.req.Spec.BackupName,
 			),
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
 				types.MergePatchType,
@@ -391,24 +400,22 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 	})
 
 	t.Run("backup storage location is in read-only mode", func(t *testing.T) {
-		backup := builder.ForBackup(v1.DefaultNamespace, "foo").StorageLocation("default").Result()
-		location := builder.ForBackupStorageLocation("velero", "default").AccessMode(v1.BackupStorageLocationAccessModeReadOnly).Result()
+		backup := builder.ForBackup(velerov1api.DefaultNamespace, "foo").StorageLocation("default").Result()
+		location := builder.ForBackupStorageLocation("velero", "default").AccessMode(velerov1api.BackupStorageLocationAccessModeReadOnly).Result()
 
-		td := setupBackupDeletionControllerTest(backup)
-
-		td.sharedInformers.Velero().V1().BackupStorageLocations().Informer().GetStore().Add(location)
+		td := setupBackupDeletionControllerTest(t, location, backup)
 
 		err := td.controller.processRequest(td.req)
 		require.NoError(t, err)
 
 		expectedActions := []core.Action{
 			core.NewGetAction(
-				v1.SchemeGroupVersion.WithResource("backups"),
+				velerov1api.SchemeGroupVersion.WithResource("backups"),
 				td.req.Namespace,
 				td.req.Spec.BackupName,
 			),
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
 				types.MergePatchType,
@@ -420,42 +427,43 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 	})
 
 	t.Run("full delete, no errors", func(t *testing.T) {
-		backup := builder.ForBackup(v1.DefaultNamespace, "foo").Result()
+		backup := builder.ForBackup(velerov1api.DefaultNamespace, "foo").Result()
 		backup.UID = "uid"
 		backup.Spec.StorageLocation = "primary"
 
-		restore1 := builder.ForRestore("velero", "restore-1").Phase(v1.RestorePhaseCompleted).Backup("foo").Result()
-		restore2 := builder.ForRestore("velero", "restore-2").Phase(v1.RestorePhaseCompleted).Backup("foo").Result()
-		restore3 := builder.ForRestore("velero", "restore-3").Phase(v1.RestorePhaseCompleted).Backup("some-other-backup").Result()
+		restore1 := builder.ForRestore("velero", "restore-1").Phase(velerov1api.RestorePhaseCompleted).Backup("foo").Result()
+		restore2 := builder.ForRestore("velero", "restore-2").Phase(velerov1api.RestorePhaseCompleted).Backup("foo").Result()
+		restore3 := builder.ForRestore("velero", "restore-3").Phase(velerov1api.RestorePhaseCompleted).Backup("some-other-backup").Result()
 
-		td := setupBackupDeletionControllerTest(backup, restore1, restore2, restore3)
+		td := setupBackupDeletionControllerTest(t, backup, restore1, restore2, restore3)
 
 		td.sharedInformers.Velero().V1().Restores().Informer().GetStore().Add(restore1)
 		td.sharedInformers.Velero().V1().Restores().Informer().GetStore().Add(restore2)
 		td.sharedInformers.Velero().V1().Restores().Informer().GetStore().Add(restore3)
 
-		location := &v1.BackupStorageLocation{
+		location := &velerov1api.BackupStorageLocation{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: backup.Namespace,
 				Name:      backup.Spec.StorageLocation,
 			},
-			Spec: v1.BackupStorageLocationSpec{
+			Spec: velerov1api.BackupStorageLocationSpec{
 				Provider: "objStoreProvider",
-				StorageType: v1.StorageType{
-					ObjectStorage: &v1.ObjectStorageLocation{
+				StorageType: velerov1api.StorageType{
+					ObjectStorage: &velerov1api.ObjectStorageLocation{
 						Bucket: "bucket",
 					},
 				},
 			},
 		}
-		require.NoError(t, td.sharedInformers.Velero().V1().BackupStorageLocations().Informer().GetStore().Add(location))
 
-		snapshotLocation := &v1.VolumeSnapshotLocation{
+		require.NoError(t, td.fakeClient.Create(context.Background(), location))
+
+		snapshotLocation := &velerov1api.VolumeSnapshotLocation{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: backup.Namespace,
 				Name:      "vsl-1",
 			},
-			Spec: v1.VolumeSnapshotLocationSpec{
+			Spec: velerov1api.VolumeSnapshotLocationSpec{
 				Provider: "provider-1",
 			},
 		}
@@ -505,55 +513,55 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 
 		expectedActions := []core.Action{
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
 				types.MergePatchType,
 				[]byte(`{"metadata":{"labels":{"velero.io/backup-name":"foo"}},"status":{"phase":"InProgress"}}`),
 			),
 			core.NewGetAction(
-				v1.SchemeGroupVersion.WithResource("backups"),
+				velerov1api.SchemeGroupVersion.WithResource("backups"),
 				td.req.Namespace,
 				td.req.Spec.BackupName,
 			),
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
 				types.MergePatchType,
 				[]byte(`{"metadata":{"labels":{"velero.io/backup-uid":"uid"}}}`),
 			),
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("backups"),
+				velerov1api.SchemeGroupVersion.WithResource("backups"),
 				td.req.Namespace,
 				td.req.Spec.BackupName,
 				types.MergePatchType,
 				[]byte(`{"status":{"phase":"Deleting"}}`),
 			),
 			core.NewDeleteAction(
-				v1.SchemeGroupVersion.WithResource("restores"),
+				velerov1api.SchemeGroupVersion.WithResource("restores"),
 				td.req.Namespace,
 				"restore-1",
 			),
 			core.NewDeleteAction(
-				v1.SchemeGroupVersion.WithResource("restores"),
+				velerov1api.SchemeGroupVersion.WithResource("restores"),
 				td.req.Namespace,
 				"restore-2",
 			),
 			core.NewDeleteAction(
-				v1.SchemeGroupVersion.WithResource("backups"),
+				velerov1api.SchemeGroupVersion.WithResource("backups"),
 				td.req.Namespace,
 				td.req.Spec.BackupName,
 			),
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
 				types.MergePatchType,
 				[]byte(`{"status":{"phase":"Processed"}}`),
 			),
 			core.NewDeleteCollectionAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				pkgbackup.NewDeleteBackupRequestListOptions(td.req.Spec.BackupName, "uid"),
 			),
@@ -575,19 +583,19 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 		backup.Spec.StorageLocation = "primary"
 
 		restore1 := builder.ForRestore("velero", "restore-1").
-			Phase(v1.RestorePhaseCompleted).
+			Phase(velerov1api.RestorePhaseCompleted).
 			Backup("the-really-long-backup-name-that-is-much-more-than-63-characters").
 			Result()
 		restore2 := builder.ForRestore("velero", "restore-2").
-			Phase(v1.RestorePhaseCompleted).
+			Phase(velerov1api.RestorePhaseCompleted).
 			Backup("the-really-long-backup-name-that-is-much-more-than-63-characters").
 			Result()
 		restore3 := builder.ForRestore("velero", "restore-3").
-			Phase(v1.RestorePhaseCompleted).
+			Phase(velerov1api.RestorePhaseCompleted).
 			Backup("some-other-backup").
 			Result()
 
-		td := setupBackupDeletionControllerTest(backup, restore1, restore2, restore3)
+		td := setupBackupDeletionControllerTest(t, backup, restore1, restore2, restore3)
 		td.req = pkgbackup.NewDeleteBackupRequest(backup.Name, string(backup.UID))
 		td.req.Namespace = "velero"
 		td.req.Name = "foo-abcde"
@@ -595,28 +603,28 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 		td.sharedInformers.Velero().V1().Restores().Informer().GetStore().Add(restore2)
 		td.sharedInformers.Velero().V1().Restores().Informer().GetStore().Add(restore3)
 
-		location := &v1.BackupStorageLocation{
+		location := &velerov1api.BackupStorageLocation{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: backup.Namespace,
 				Name:      backup.Spec.StorageLocation,
 			},
-			Spec: v1.BackupStorageLocationSpec{
+			Spec: velerov1api.BackupStorageLocationSpec{
 				Provider: "objStoreProvider",
-				StorageType: v1.StorageType{
-					ObjectStorage: &v1.ObjectStorageLocation{
+				StorageType: velerov1api.StorageType{
+					ObjectStorage: &velerov1api.ObjectStorageLocation{
 						Bucket: "bucket",
 					},
 				},
 			},
 		}
-		require.NoError(t, td.sharedInformers.Velero().V1().BackupStorageLocations().Informer().GetStore().Add(location))
+		require.NoError(t, td.fakeClient.Create(context.Background(), location))
 
-		snapshotLocation := &v1.VolumeSnapshotLocation{
+		snapshotLocation := &velerov1api.VolumeSnapshotLocation{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: backup.Namespace,
 				Name:      "vsl-1",
 			},
-			Spec: v1.VolumeSnapshotLocationSpec{
+			Spec: velerov1api.VolumeSnapshotLocationSpec{
 				Provider: "provider-1",
 			},
 		}
@@ -664,55 +672,55 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 
 		expectedActions := []core.Action{
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
 				types.MergePatchType,
 				[]byte(`{"metadata":{"labels":{"velero.io/backup-name":"the-really-long-backup-name-that-is-much-more-than-63-cha6ca4bc"}},"status":{"phase":"InProgress"}}`),
 			),
 			core.NewGetAction(
-				v1.SchemeGroupVersion.WithResource("backups"),
+				velerov1api.SchemeGroupVersion.WithResource("backups"),
 				td.req.Namespace,
 				td.req.Spec.BackupName,
 			),
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
 				types.MergePatchType,
 				[]byte(`{"metadata":{"labels":{"velero.io/backup-uid":"uid"}}}`),
 			),
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("backups"),
+				velerov1api.SchemeGroupVersion.WithResource("backups"),
 				td.req.Namespace,
 				td.req.Spec.BackupName,
 				types.MergePatchType,
 				[]byte(`{"status":{"phase":"Deleting"}}`),
 			),
 			core.NewDeleteAction(
-				v1.SchemeGroupVersion.WithResource("restores"),
+				velerov1api.SchemeGroupVersion.WithResource("restores"),
 				td.req.Namespace,
 				"restore-1",
 			),
 			core.NewDeleteAction(
-				v1.SchemeGroupVersion.WithResource("restores"),
+				velerov1api.SchemeGroupVersion.WithResource("restores"),
 				td.req.Namespace,
 				"restore-2",
 			),
 			core.NewDeleteAction(
-				v1.SchemeGroupVersion.WithResource("backups"),
+				velerov1api.SchemeGroupVersion.WithResource("backups"),
 				td.req.Namespace,
 				td.req.Spec.BackupName,
 			),
 			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
 				types.MergePatchType,
 				[]byte(`{"status":{"phase":"Processed"}}`),
 			),
 			core.NewDeleteCollectionAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				pkgbackup.NewDeleteBackupRequestListOptions(td.req.Spec.BackupName, "uid"),
 			),
@@ -726,6 +734,7 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 }
 
 func TestBackupDeletionControllerDeleteExpiredRequests(t *testing.T) {
+
 	now := time.Date(2018, 4, 4, 12, 0, 0, 0, time.UTC)
 	unexpired1 := time.Date(2018, 4, 4, 11, 0, 0, 0, time.UTC)
 	unexpired2 := time.Date(2018, 4, 3, 12, 0, 1, 0, time.UTC)
@@ -734,7 +743,7 @@ func TestBackupDeletionControllerDeleteExpiredRequests(t *testing.T) {
 
 	tests := []struct {
 		name              string
-		requests          []*v1.DeleteBackupRequest
+		requests          []*velerov1api.DeleteBackupRequest
 		expectedDeletions []string
 	}{
 		{
@@ -742,14 +751,14 @@ func TestBackupDeletionControllerDeleteExpiredRequests(t *testing.T) {
 		},
 		{
 			name: "older than max age, phase = '', don't delete",
-			requests: []*v1.DeleteBackupRequest{
+			requests: []*velerov1api.DeleteBackupRequest{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace:         "ns",
 						Name:              "name",
 						CreationTimestamp: metav1.Time{Time: expired1},
 					},
-					Status: v1.DeleteBackupRequestStatus{
+					Status: velerov1api.DeleteBackupRequestStatus{
 						Phase: "",
 					},
 				},
@@ -757,45 +766,45 @@ func TestBackupDeletionControllerDeleteExpiredRequests(t *testing.T) {
 		},
 		{
 			name: "older than max age, phase = New, don't delete",
-			requests: []*v1.DeleteBackupRequest{
+			requests: []*velerov1api.DeleteBackupRequest{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace:         "ns",
 						Name:              "name",
 						CreationTimestamp: metav1.Time{Time: expired1},
 					},
-					Status: v1.DeleteBackupRequestStatus{
-						Phase: v1.DeleteBackupRequestPhaseNew,
+					Status: velerov1api.DeleteBackupRequestStatus{
+						Phase: velerov1api.DeleteBackupRequestPhaseNew,
 					},
 				},
 			},
 		},
 		{
 			name: "older than max age, phase = InProcess, don't delete",
-			requests: []*v1.DeleteBackupRequest{
+			requests: []*velerov1api.DeleteBackupRequest{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace:         "ns",
 						Name:              "name",
 						CreationTimestamp: metav1.Time{Time: expired1},
 					},
-					Status: v1.DeleteBackupRequestStatus{
-						Phase: v1.DeleteBackupRequestPhaseInProgress,
+					Status: velerov1api.DeleteBackupRequestStatus{
+						Phase: velerov1api.DeleteBackupRequestPhaseInProgress,
 					},
 				},
 			},
 		},
 		{
 			name: "some expired, some not",
-			requests: []*v1.DeleteBackupRequest{
+			requests: []*velerov1api.DeleteBackupRequest{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace:         "ns",
 						Name:              "unexpired-1",
 						CreationTimestamp: metav1.Time{Time: unexpired1},
 					},
-					Status: v1.DeleteBackupRequestStatus{
-						Phase: v1.DeleteBackupRequestPhaseProcessed,
+					Status: velerov1api.DeleteBackupRequestStatus{
+						Phase: velerov1api.DeleteBackupRequestPhaseProcessed,
 					},
 				},
 				{
@@ -804,8 +813,8 @@ func TestBackupDeletionControllerDeleteExpiredRequests(t *testing.T) {
 						Name:              "expired-1",
 						CreationTimestamp: metav1.Time{Time: expired1},
 					},
-					Status: v1.DeleteBackupRequestStatus{
-						Phase: v1.DeleteBackupRequestPhaseProcessed,
+					Status: velerov1api.DeleteBackupRequestStatus{
+						Phase: velerov1api.DeleteBackupRequestPhaseProcessed,
 					},
 				},
 				{
@@ -814,8 +823,8 @@ func TestBackupDeletionControllerDeleteExpiredRequests(t *testing.T) {
 						Name:              "unexpired-2",
 						CreationTimestamp: metav1.Time{Time: unexpired2},
 					},
-					Status: v1.DeleteBackupRequestStatus{
-						Phase: v1.DeleteBackupRequestPhaseProcessed,
+					Status: velerov1api.DeleteBackupRequestStatus{
+						Phase: velerov1api.DeleteBackupRequestPhaseProcessed,
 					},
 				},
 				{
@@ -824,8 +833,8 @@ func TestBackupDeletionControllerDeleteExpiredRequests(t *testing.T) {
 						Name:              "expired-2",
 						CreationTimestamp: metav1.Time{Time: expired2},
 					},
-					Status: v1.DeleteBackupRequestStatus{
-						Phase: v1.DeleteBackupRequestPhaseProcessed,
+					Status: velerov1api.DeleteBackupRequestStatus{
+						Phase: velerov1api.DeleteBackupRequestPhaseProcessed,
 					},
 				},
 			},
@@ -836,6 +845,7 @@ func TestBackupDeletionControllerDeleteExpiredRequests(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			client := fake.NewSimpleClientset()
+			fakeClient := newFakeClient(t)
 			sharedInformers := informers.NewSharedInformerFactory(client, 0)
 
 			controller := NewBackupDeletionController(
@@ -848,8 +858,11 @@ func TestBackupDeletionControllerDeleteExpiredRequests(t *testing.T) {
 				NewBackupTracker(),
 				nil,
 				sharedInformers.Velero().V1().PodVolumeBackups().Lister(),
-				sharedInformers.Velero().V1().BackupStorageLocations().Lister(),
+				fakeClient,
 				sharedInformers.Velero().V1().VolumeSnapshotLocations().Lister(),
+				nil, // csiSnapshotLister
+				nil, // csiSnapshotContentLister
+				nil, // csiSnapshotClient
 				nil, // new plugin manager func
 				metrics.NewServerMetrics(),
 			).(*backupDeletionController)
@@ -866,10 +879,349 @@ func TestBackupDeletionControllerDeleteExpiredRequests(t *testing.T) {
 
 			expectedActions := []core.Action{}
 			for _, name := range test.expectedDeletions {
-				expectedActions = append(expectedActions, core.NewDeleteAction(v1.SchemeGroupVersion.WithResource("deletebackuprequests"), "ns", name))
+				expectedActions = append(expectedActions, core.NewDeleteAction(velerov1api.SchemeGroupVersion.WithResource("deletebackuprequests"), "ns", name))
 			}
 
 			velerotest.CompareActions(t, expectedActions, client.Actions())
+		})
+	}
+}
+
+func TestSetVolumeSnapshotContentDeletionPolicy(t *testing.T) {
+	testCases := []struct {
+		name         string
+		inputVSCName string
+		objs         []runtime.Object
+		expectError  bool
+	}{
+		{
+			name:         "should update DeletionPolicy of a VSC from retain to delete",
+			inputVSCName: "retainVSC",
+			objs: []runtime.Object{
+				&snapshotv1beta1api.VolumeSnapshotContent{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "retainVSC",
+					},
+					Spec: snapshotv1beta1api.VolumeSnapshotContentSpec{
+						DeletionPolicy: snapshotv1beta1api.VolumeSnapshotContentRetain,
+					},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:         "should be a no-op updating if DeletionPolicy of a VSC is already Delete",
+			inputVSCName: "deleteVSC",
+			objs: []runtime.Object{
+				&snapshotv1beta1api.VolumeSnapshotContent{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "deleteVSC",
+					},
+					Spec: snapshotv1beta1api.VolumeSnapshotContentSpec{
+						DeletionPolicy: snapshotv1beta1api.VolumeSnapshotContentDelete,
+					},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:         "should update DeletionPolicy of a VSC with no DeletionPolicy",
+			inputVSCName: "nothingVSC",
+			objs: []runtime.Object{
+				&snapshotv1beta1api.VolumeSnapshotContent{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "nothingVSC",
+					},
+					Spec: snapshotv1beta1api.VolumeSnapshotContentSpec{},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:         "should return not found error if supplied VSC does not exist",
+			inputVSCName: "does-not-exist",
+			objs:         []runtime.Object{},
+			expectError:  true,
+		},
+	}
+
+	log := velerotest.NewLogger().WithFields(
+		logrus.Fields{
+			"unit-test": "unit-test",
+		},
+	)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeClient := snapshotFake.NewSimpleClientset(tc.objs...)
+			err := setVolumeSnapshotContentDeletionPolicy(tc.inputVSCName, fakeClient.SnapshotV1beta1(), log)
+			if tc.expectError {
+				assert.NotNil(t, err)
+			} else {
+				assert.Nil(t, err)
+				actual, err := fakeClient.SnapshotV1beta1().VolumeSnapshotContents().Get(tc.inputVSCName, metav1.GetOptions{})
+				assert.Nil(t, err)
+				assert.Equal(t, snapshotv1beta1api.VolumeSnapshotContentDelete, actual.Spec.DeletionPolicy)
+			}
+		})
+	}
+}
+
+func TestDeleteCSIVolumeSnapshots(t *testing.T) {
+	//Backup1
+	ns1VS1VSCName := "ns1vs1vsc"
+	ns1VS1VSC := snapshotv1beta1api.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: ns1VS1VSCName,
+		},
+		Spec: snapshotv1beta1api.VolumeSnapshotContentSpec{
+			DeletionPolicy: snapshotv1beta1api.VolumeSnapshotContentRetain,
+		},
+	}
+	ns1VS1 := snapshotv1beta1api.VolumeSnapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vs1",
+			Namespace: "ns1",
+			Labels: map[string]string{
+				velerov1api.BackupNameLabel: "backup1",
+			},
+		},
+		Status: &snapshotv1beta1api.VolumeSnapshotStatus{
+			BoundVolumeSnapshotContentName: &ns1VS1VSCName,
+		},
+	}
+
+	ns1VS2VSCName := "ns1vs2vsc"
+	ns1VS2VSC := snapshotv1beta1api.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: ns1VS2VSCName,
+		},
+		Spec: snapshotv1beta1api.VolumeSnapshotContentSpec{
+			DeletionPolicy: snapshotv1beta1api.VolumeSnapshotContentRetain,
+		},
+	}
+	ns1VS2 := snapshotv1beta1api.VolumeSnapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vs2",
+			Namespace: "ns1",
+			Labels: map[string]string{
+				velerov1api.BackupNameLabel: "backup1",
+			},
+		},
+		Status: &snapshotv1beta1api.VolumeSnapshotStatus{
+			BoundVolumeSnapshotContentName: &ns1VS2VSCName,
+		},
+	}
+
+	ns2VS1VSCName := "ns2vs1vsc"
+	ns2VS1VSC := snapshotv1beta1api.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: ns2VS1VSCName,
+		},
+		Spec: snapshotv1beta1api.VolumeSnapshotContentSpec{
+			DeletionPolicy: snapshotv1beta1api.VolumeSnapshotContentRetain,
+		},
+	}
+	ns2VS1 := snapshotv1beta1api.VolumeSnapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vs1",
+			Namespace: "ns2",
+			Labels: map[string]string{
+				velerov1api.BackupNameLabel: "backup1",
+			},
+		},
+		Status: &snapshotv1beta1api.VolumeSnapshotStatus{
+			BoundVolumeSnapshotContentName: &ns2VS1VSCName,
+		},
+	}
+
+	ns2VS2VSCName := "ns2vs2vsc"
+	ns2VS2VSC := snapshotv1beta1api.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: ns2VS2VSCName,
+		},
+		Spec: snapshotv1beta1api.VolumeSnapshotContentSpec{
+			DeletionPolicy: snapshotv1beta1api.VolumeSnapshotContentRetain,
+		},
+	}
+	ns2VS2 := snapshotv1beta1api.VolumeSnapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vs2",
+			Namespace: "ns2",
+			Labels: map[string]string{
+				velerov1api.BackupNameLabel: "backup1",
+			},
+		},
+		Status: &snapshotv1beta1api.VolumeSnapshotStatus{
+			BoundVolumeSnapshotContentName: &ns2VS2VSCName,
+		},
+	}
+
+	// Backup2
+	ns1NilStatusVS := snapshotv1beta1api.VolumeSnapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ns1NilStatusVS",
+			Namespace: "ns2",
+			Labels: map[string]string{
+				velerov1api.BackupNameLabel: "backup2",
+			},
+		},
+		Status: nil,
+	}
+
+	// Backup3
+	ns1NilBoundVSCVS := snapshotv1beta1api.VolumeSnapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ns1NilBoundVSCVS",
+			Namespace: "ns2",
+			Labels: map[string]string{
+				velerov1api.BackupNameLabel: "backup3",
+			},
+		},
+		Status: &snapshotv1beta1api.VolumeSnapshotStatus{
+			BoundVolumeSnapshotContentName: nil,
+		},
+	}
+
+	// Backup4
+	notFound := "not-found"
+	ns1NonExistentVSCVS := snapshotv1beta1api.VolumeSnapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ns1NonExistentVSCVS",
+			Namespace: "ns2",
+			Labels: map[string]string{
+				velerov1api.BackupNameLabel: "backup3",
+			},
+		},
+		Status: &snapshotv1beta1api.VolumeSnapshotStatus{
+			BoundVolumeSnapshotContentName: &notFound,
+		},
+	}
+
+	testCases := []struct {
+		name       string
+		backupName string
+		objs       []runtime.Object
+	}{
+		{
+			name:       "should delete volumesnapshots bound to existing volumesnapshotcontent",
+			backupName: "backup1",
+			objs:       []runtime.Object{&ns1VS1VSC, &ns1VS1, &ns1VS2VSC, &ns1VS2, &ns2VS1VSC, &ns2VS1, &ns2VS2VSC, &ns2VS2},
+		},
+		{
+			name:       "should delete volumesnapshots with nil status",
+			backupName: "backup2",
+			objs:       []runtime.Object{&ns1NilStatusVS},
+		},
+		{
+			name:       "should delete volumesnapshots with nil BoundVolumeSnapshotContentName",
+			backupName: "backup3",
+			objs:       []runtime.Object{&ns1NilBoundVSCVS},
+		},
+		{
+			name:       "should delete volumesnapshots bound to non-existent volumesnapshotcontents",
+			backupName: "backup4",
+			objs:       []runtime.Object{&ns1NonExistentVSCVS},
+		},
+		{
+			name:       "should be a no-op when there are no volumesnapshots to delete",
+			backupName: "backup-no-vs",
+			objs:       []runtime.Object{},
+		},
+	}
+
+	log := velerotest.NewLogger().WithFields(
+		logrus.Fields{
+			"unit-test": "unit-test",
+		},
+	)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeClient := snapshotFake.NewSimpleClientset(tc.objs...)
+			fakeSharedInformer := snapshotv1beta1informers.NewSharedInformerFactoryWithOptions(fakeClient, 0)
+			for _, o := range tc.objs {
+				fakeSharedInformer.Snapshot().V1beta1().VolumeSnapshots().Informer().GetStore().Add(o)
+			}
+			errs := deleteCSIVolumeSnapshots(tc.backupName, fakeSharedInformer.Snapshot().V1beta1().VolumeSnapshots().Lister(), fakeClient.SnapshotV1beta1(), log)
+			assert.Empty(t, errs)
+		})
+	}
+}
+
+func TestDeleteCSIVolumeSnapshotContents(t *testing.T) {
+	retainVSC := snapshotv1beta1api.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "retainVSC",
+			Labels: map[string]string{
+				velerov1api.BackupNameLabel: "backup1",
+			},
+		},
+		Spec: snapshotv1beta1api.VolumeSnapshotContentSpec{
+			DeletionPolicy: snapshotv1beta1api.VolumeSnapshotContentRetain,
+		},
+	}
+	deleteVSC := snapshotv1beta1api.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "deleteVSC",
+			Labels: map[string]string{
+				velerov1api.BackupNameLabel: "backup2",
+			},
+		},
+		Spec: snapshotv1beta1api.VolumeSnapshotContentSpec{
+			DeletionPolicy: snapshotv1beta1api.VolumeSnapshotContentDelete,
+		},
+	}
+
+	nothingVSC := snapshotv1beta1api.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "nothingVSC",
+			Labels: map[string]string{
+				velerov1api.BackupNameLabel: "backup3",
+			},
+		},
+		Spec: snapshotv1beta1api.VolumeSnapshotContentSpec{},
+	}
+
+	testCases := []struct {
+		name       string
+		backupName string
+		objs       []runtime.Object
+	}{
+		{
+			name:       "should delete volumesnapshotcontent with DeletionPolicy Retain",
+			backupName: "backup1",
+			objs:       []runtime.Object{&retainVSC},
+		},
+		{
+			name:       "should delete volumesnapshotcontent with DeletionPolicy Delete",
+			backupName: "backup3",
+			objs:       []runtime.Object{&deleteVSC},
+		},
+		{
+			name:       "should delete volumesnapshotcontent with No DeletionPolicy",
+			backupName: "backup3",
+			objs:       []runtime.Object{&nothingVSC},
+		},
+		{
+			name:       "should return no error when backup has no volumesnapshotconents",
+			backupName: "backup-with-no-vsc",
+			objs:       []runtime.Object{},
+		},
+	}
+	log := velerotest.NewLogger().WithFields(
+		logrus.Fields{
+			"unit-test": "unit-test",
+		},
+	)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeClient := snapshotFake.NewSimpleClientset(tc.objs...)
+			fakeSharedInformer := snapshotv1beta1informers.NewSharedInformerFactoryWithOptions(fakeClient, 0)
+			for _, o := range tc.objs {
+				fakeSharedInformer.Snapshot().V1beta1().VolumeSnapshotContents().Informer().GetStore().Add(o)
+			}
+
+			errs := deleteCSIVolumeSnapshotContents(tc.backupName, fakeSharedInformer.Snapshot().V1beta1().VolumeSnapshotContents().Lister(), fakeClient.SnapshotV1beta1(), log)
+			assert.Empty(t, errs)
 		})
 	}
 }

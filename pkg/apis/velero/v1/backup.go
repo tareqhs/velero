@@ -1,5 +1,5 @@
 /*
-Copyright 2017, 2019 the Velero contributors.
+Copyright 2020 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -82,6 +82,12 @@ type BackupSpec struct {
 	// VolumeSnapshotLocations is a list containing names of VolumeSnapshotLocations associated with this backup.
 	// +optional
 	VolumeSnapshotLocations []string `json:"volumeSnapshotLocations,omitempty"`
+
+	// DefaultVolumesToRestic specifies whether restic should be used to take a
+	// backup of all pod volumes by default.
+	// +optional
+	// + nullable
+	DefaultVolumesToRestic *bool `json:"defaultVolumesToRestic,omitempty"`
 }
 
 // BackupHooks contains custom behaviors that should be executed at different phases of the backup.
@@ -212,9 +218,14 @@ const (
 
 // BackupStatus captures the current status of a Velero backup.
 type BackupStatus struct {
-	// Version is the backup format version.
+	// Version is the backup format major version.
+	// Deprecated: Please see FormatVersion
 	// +optional
 	Version int `json:"version,omitempty"`
+
+	// FormatVersion is the backup format version, including major, minor, and patch version.
+	// +optional
+	FormatVersion string `json:"formatVersion,omitempty"`
 
 	// Expiration is when this Backup is eligible for garbage-collection.
 	// +optional
@@ -268,6 +279,28 @@ type BackupStatus struct {
 	// file in object storage.
 	// +optional
 	Errors int `json:"errors,omitempty"`
+
+	// Progress contains information about the backup's execution progress. Note
+	// that this information is best-effort only -- if Velero fails to update it
+	// during a backup for any reason, it may be inaccurate/stale.
+	// +optional
+	// +nullable
+	Progress *BackupProgress `json:"progress,omitempty"`
+}
+
+// BackupProgress stores information about the progress of a Backup's execution.
+type BackupProgress struct {
+	// TotalItems is the total number of items to be backed up. This number may change
+	// throughout the execution of the backup due to plugins that return additional related
+	// items to back up, the velero.io/exclude-from-backup label, and various other
+	// filters that happen as items are processed.
+	// +optional
+	TotalItems int `json:"totalItems,omitempty"`
+
+	// ItemsBackedUp is the number of items that have actually been written to the
+	// backup tarball so far.
+	// +optional
+	ItemsBackedUp int `json:"itemsBackedUp,omitempty"`
 }
 
 // +genclient

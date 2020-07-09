@@ -12,6 +12,16 @@ changelog.
 
 Add that to the PR.
 
+If a PR does not warrant a changelog, the CI check for a changelog can be skipped by applying a `changelog-not-required` label on the PR.
+
+## Copyright header 
+
+Whenever a source code file is being modified, the copyright notice should be updated to our standard copyright notice. That is, it should read “Copyright [insert current year] the Velero contributors.” 
+
+For new files, the entire copyright and license header must be added.
+
+Please note that doc files do not need a copyright header.
+
 ## Code
 
 - Log messages are capitalized.
@@ -34,7 +44,7 @@ Add that to the PR.
 
 For imports, we use the following convention:
 
-<group><version><api | client | informer | ...>
+`<group><version><api | client | informer | ...>`
 
 Example:
 
@@ -43,8 +53,8 @@ Example:
     	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
     	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
     	corev1listers "k8s.io/client-go/listers/core/v1"
-        
-        velerov1api ""github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+       
+        velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
         velerov1client "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
     )
 
@@ -63,6 +73,16 @@ mockery -name=Restorer
 ```
 
 Might need to run `make update` to update the imports.
+
+## Kubernetes Labels
+
+When generating label values, be sure to pass them through the `label.GetValidName()` helper function.
+
+This will help ensure that the values are the proper length and format to be stored and queried.
+
+In general, UIDs are safe to persist as label values.
+
+This function is not relevant to annotation values, which do not have restrictions.
 
 ## DCO Sign off
 

@@ -291,7 +291,7 @@ func getNextRunTime(schedule *api.Schedule, cronSchedule cron.Schedule, asOf tim
 }
 
 func (c *scheduleController) getBackup(item *api.Schedule, timestamp time.Time) *api.Backup {
-	name := fmt.Sprintf("%s-%s", item.Name, timestamp.Format("20060102150405"))
+	name := item.TimestampedName(timestamp)
 	backup := builder.
 		ForBackup(item.Namespace, name).
 		FromSchedule(item, c.ignoredLabels).
